@@ -3,6 +3,7 @@ import argparse
 import sys
 from collections import defaultdict
 import re
+import time
 
 line_re_24 = re.compile(r"""
     ^(?P<timestamp>[\d\.]+)\s(\(db\s(?P<db>\d+)\)\s)?"(?P<command>\w+)"(\s"(?P<key>[^(?<!\\)"]+)(?<!\\)")?(\s(?P<args>.+))?$
@@ -10,6 +11,10 @@ line_re_24 = re.compile(r"""
 
 line_re_26 = re.compile(r"""
     ^(?P<timestamp>[\d\.]+)\s\[(?P<db>\d+)\s\d+\.\d+\.\d+\.\d+:\d+]\s"(?P<command>\w+)"(\s"(?P<key>[^(?<!\\)"]+)(?<!\\)")?(\s(?P<args>.+))?$
+    """, re.VERBOSE)
+
+line_re_28 = re.compile(r"""
+    ^(?P<timestamp>[\d\.]+)\s\[(?P<db>0)\s[a-z0-9:.]+]\s"(?P<command>\w+)"(\s"(?P<key>[^(?<!\\)"]+)(?<!\\)")?(\s(?P<args>.+))?$
     """, re.VERBOSE)
 
 class StatCounter(object):
@@ -27,7 +32,7 @@ class StatCounter(object):
         self.last_entry = None
         self.prefix_delim = prefix_delim
         self.redis_version = redis_version
-        self.line_re = line_re_24 if self.redis_version < 2.5 else line_re_26
+        self.line_re = line_re_24 if self.redis_version < 2.5 else line_re_28
 
     def _record_duration(self, entry):
         ts = float(entry['timestamp']) * 1000 * 1000 # microseconds
@@ -55,7 +60,7 @@ class StatCounter(object):
 
     @staticmethod
     def _reformat_entry(entry):
-        max_args_to_show = 5
+        max_args_to_show = 45
         output = '"%(command)s"' % entry
         if entry['key']:
             output += ' "%(key)s"' % entry
@@ -69,7 +74,7 @@ class StatCounter(object):
     def _get_or_sort_list(self, ls):
         key = id(ls)
         if not key in self._cached_sorts:
-            sorted_items = sorted(ls)
+            sorted_items = sorted(ls, key=lambda x: x[0])
             self._cached_sorts[key] = sorted_items
         return self._cached_sorts[key]
 
@@ -86,12 +91,14 @@ class StatCounter(object):
                 ("99%", percent_99))
 
     def _heaviest_commands(self, times):
+        total_time = (self.last_ts - self.start_ts)
         times_by_command = defaultdict(int)
         for time, entry in times:
             times_by_command[entry['command']] += time
-        return self._top_n(times_by_command)
+        top_n = self._top_n(times_by_command)
+        return [(top[0], "{:10} ({:.2f}%)".format(top[1], top[1] * 100 / total_time)) for top in top_n]
 
-    def _slowest_commands(self, times, n=8):
+    def _slowest_commands(self, times, n=4):
         sorted_times = self._get_or_sort_list(times)
         slowest_commands = reversed(sorted_times[-n:])
         printable_commands = [(str(time), self._reformat_entry(entry)) \
@@ -102,24 +109,28 @@ class StatCounter(object):
         total_time = (self.last_ts - self.start_ts) / (1000*1000)
         return (
             ("Lines Processed", self.line_count),
-            ("Commands/Sec", '%.2f' % (self.line_count / total_time))
+            ("Commands/Sec", '%.2f' % (self.line_count / total_time)),
+            ("Time", '%.2f' % (total_time)),
         )
 
     def process_entry(self, entry):
+        if entry['command'] == 'evalsha':
+            entry['command'] = entry['command'] + " " + entry['key']
+            entry['key'] = None
         self._record_duration(entry)
         self._record_command(entry)
         if entry['key']:
             self._record_key(entry['key'])
 
-    def _top_n(self, stat, n=8):
-        sorted_items = sorted(stat.iteritems(), key = lambda x: x[1], reverse = True)
+    def _top_n(self, stat, n=25):
+        sorted_items = sorted(stat.items(), key = lambda x: x[1], reverse = True)
         return sorted_items[:n]
 
     def _pretty_print(self, result, title, percentages=False):
-        print title
-        print '=' * 40
+        print(title)
+        print('=' * 40)
         if not result:
-            print 'n/a\n'
+            print('n/a\n')
             return
 
         max_key_len = max((len(x[0]) for x in result))
@@ -129,8 +140,8 @@ class StatCounter(object):
             if percentages:
                 val_padding = max(max_val_len - len(str(val)), 0) * ' '
                 val = '%s%s\t(%.2f%%)' % (val, val_padding, (float(val) / self.line_count) * 100)
-            print key,key_padding,'\t',val
-        print
+            print(key,key_padding,'\t',val)
+        print("")
 
 
     def print_stats(self):
@@ -140,7 +151,7 @@ class StatCounter(object):
         self._pretty_print(self._top_n(self.commands), 'Top Commands', percentages = True)
         self._pretty_print(self._time_stats(self.times), 'Command Time (microsecs)')
         self._pretty_print(self._heaviest_commands(self.times), 'Heaviest Commands (microsecs)')
-        self._pretty_print(self._slowest_commands(self.times), 'Slowest Calls')
+        self._pretty_print(self._slowest_commands(self.times), 'Slowest Calls (microsecs)')
 
     def process_input(self, input):
         for line in input:
